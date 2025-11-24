@@ -2,6 +2,7 @@
 AgroGuard Backend - Plant Disease Detection System
 Deep Learning model for real-time crop disease detection
 Supports both VGG16 model inference and demo mode
+With JWT authentication and OAuth support
 """
 
 import os
@@ -11,9 +12,18 @@ import io
 import random
 import logging
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, url_for, session
 from flask_cors import CORS
 from PIL import Image
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Import authentication modules
+from models import db, User, DetectionHistory, init_db
+from auth_utils import generate_token, token_required, optional_token, validate_email, validate_password
+from oauth_config import init_oauth, get_google_user_info, get_facebook_user_info
 
 # Optional PyTorch imports - graceful fallback to demo mode
 try:
@@ -33,8 +43,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-change-in-production')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///agroguard.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# CORS configuration - allow credentials for OAuth
+CORS(app, supports_credentials=True, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:5173", "http://localhost:3000"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
+
+# Initialize database
+init_db(app)
+
+# Initialize OAuth
+oauth = init_oauth(app)
 
 # AI Integration - Google Gemini (Optional)
 ai_enabled = False
@@ -410,12 +438,397 @@ except Exception as e:
     logger.error(f"Failed to initialize detector: {e}")
     detector = None
 
+# ============================================
+# AUTHENTICATION ENDPOINTS
+# ============================================
+
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    """Register new user with email and password"""
+    try:
+        data = request.json
+        
+        # Validate required fields
+        if not data.get('email') or not data.get('password'):
+            return jsonify({'success': False, 'message': 'Email and password are required'}), 400
+        
+        email = data['email'].lower().strip()
+        password = data['password']
+        
+        # Validate email format
+        if not validate_email(email):
+            return jsonify({'success': False, 'message': 'Invalid email format'}), 400
+        
+        # Validate password strength
+        valid, message = validate_password(password)
+        if not valid:
+            return jsonify({'success': False, 'message': message}), 400
+        
+        # Check if user already exists
+        existing_user = User.query.filter_by(email=email).first()
+        if existing_user:
+            return jsonify({'success': False, 'message': 'Email already registered'}), 409
+        
+        # Create new user
+        user = User(
+            email=email,
+            username=data.get('username', email.split('@')[0]),
+            full_name=data.get('full_name'),
+            provider='email',
+            is_verified=False
+        )
+        user.set_password(password)
+        
+        db.session.add(user)
+        db.session.commit()
+        
+        # Generate JWT token
+        token = generate_token(user.id, user.email)
+        
+        logger.info(f"New user registered: {email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Registration successful',
+            'token': token,
+            'user': user.to_dict()
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Registration error: {str(e)}")
+        return jsonify({'success': False, 'message': 'Registration failed', 'error': str(e)}), 500
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    """Login with email and password"""
+    try:
+        data = request.json
+        
+        if not data.get('email') or not data.get('password'):
+            return jsonify({'success': False, 'message': 'Email and password are required'}), 400
+        
+        email = data['email'].lower().strip()
+        password = data['password']
+        
+        # Find user by email
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            return jsonify({'success': False, 'message': 'Invalid email or password'}), 401
+        
+        # Verify password
+        if not user.check_password(password):
+            return jsonify({'success': False, 'message': 'Invalid email or password'}), 401
+        
+        # Check if account is active
+        if not user.is_active:
+            return jsonify({'success': False, 'message': 'Account is disabled'}), 403
+        
+        # Update last login
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        
+        # Generate JWT token
+        token = generate_token(user.id, user.email)
+        
+        logger.info(f"User logged in: {email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login successful',
+            'token': token,
+            'user': user.to_dict()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}")
+        return jsonify({'success': False, 'message': 'Login failed', 'error': str(e)}), 500
+
+
+@app.route('/api/auth/google')
+def google_login():
+    """Initiate Google OAuth flow"""
+    try:
+        redirect_uri = url_for('google_callback', _external=True)
+        return oauth.google.authorize_redirect(redirect_uri)
+    except Exception as e:
+        logger.error(f"Google OAuth initiation error: {str(e)}")
+        return jsonify({'success': False, 'message': 'Google login failed'}), 500
+
+
+@app.route('/api/auth/google/callback')
+def google_callback():
+    """Google OAuth callback"""
+    try:
+        token = oauth.google.authorize_access_token()
+        user_info = get_google_user_info(token['access_token'])
+        
+        if not user_info:
+            return redirect(f"{os.getenv('FRONTEND_URL', 'http://localhost:5173')}/login?error=google_auth_failed")
+        
+        email = user_info.get('email')
+        google_id = user_info.get('id')
+        name = user_info.get('name')
+        picture = user_info.get('picture')
+        
+        # Find or create user
+        user = User.query.filter_by(email=email).first()
+        
+        if not user:
+            # Create new user
+            user = User(
+                email=email,
+                username=email.split('@')[0],
+                full_name=name,
+                profile_picture=picture,
+                provider='google',
+                provider_id=google_id,
+                is_verified=True
+            )
+            db.session.add(user)
+        else:
+            # Update existing user
+            if not user.provider:
+                user.provider = 'google'
+                user.provider_id = google_id
+            user.last_login = datetime.utcnow()
+        
+        db.session.commit()
+        
+        # Generate JWT token
+        jwt_token = generate_token(user.id, user.email)
+        
+        logger.info(f"User logged in with Google: {email}")
+        
+        # Redirect to frontend with token
+        return redirect(f"{os.getenv('FRONTEND_URL', 'http://localhost:5173')}/auth/callback?token={jwt_token}")
+        
+    except Exception as e:
+        logger.error(f"Google callback error: {str(e)}")
+        return redirect(f"{os.getenv('FRONTEND_URL', 'http://localhost:5173')}/login?error=google_auth_failed")
+
+
+@app.route('/api/auth/facebook')
+def facebook_login():
+    """Initiate Facebook OAuth flow"""
+    try:
+        redirect_uri = url_for('facebook_callback', _external=True)
+        return oauth.facebook.authorize_redirect(redirect_uri)
+    except Exception as e:
+        logger.error(f"Facebook OAuth initiation error: {str(e)}")
+        return jsonify({'success': False, 'message': 'Facebook login failed'}), 500
+
+
+@app.route('/api/auth/facebook/callback')
+def facebook_callback():
+    """Facebook OAuth callback"""
+    try:
+        token = oauth.facebook.authorize_access_token()
+        user_info = get_facebook_user_info(token['access_token'])
+        
+        if not user_info:
+            return redirect(f"{os.getenv('FRONTEND_URL', 'http://localhost:5173')}/login?error=facebook_auth_failed")
+        
+        email = user_info.get('email')
+        facebook_id = user_info.get('id')
+        name = user_info.get('name')
+        picture = user_info.get('picture', {}).get('data', {}).get('url')
+        
+        if not email:
+            return redirect(f"{os.getenv('FRONTEND_URL', 'http://localhost:5173')}/login?error=no_email")
+        
+        # Find or create user
+        user = User.query.filter_by(email=email).first()
+        
+        if not user:
+            # Create new user
+            user = User(
+                email=email,
+                username=email.split('@')[0],
+                full_name=name,
+                profile_picture=picture,
+                provider='facebook',
+                provider_id=facebook_id,
+                is_verified=True
+            )
+            db.session.add(user)
+        else:
+            # Update existing user
+            if not user.provider:
+                user.provider = 'facebook'
+                user.provider_id = facebook_id
+            user.last_login = datetime.utcnow()
+        
+        db.session.commit()
+        
+        # Generate JWT token
+        jwt_token = generate_token(user.id, user.email)
+        
+        logger.info(f"User logged in with Facebook: {email}")
+        
+        # Redirect to frontend with token
+        return redirect(f"{os.getenv('FRONTEND_URL', 'http://localhost:5173')}/auth/callback?token={jwt_token}")
+        
+    except Exception as e:
+        logger.error(f"Facebook callback error: {str(e)}")
+        return redirect(f"{os.getenv('FRONTEND_URL', 'http://localhost:5173')}/login?error=facebook_auth_failed")
+
+
+@app.route('/api/auth/me', methods=['GET'])
+@token_required
+def get_current_user(user):
+    """Get current authenticated user info"""
+    return jsonify({
+        'success': True,
+        'user': user.to_dict()
+    }), 200
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@token_required
+def logout(user):
+    """Logout (client-side token removal)"""
+    logger.info(f"User logged out: {user.email}")
+    return jsonify({
+        'success': True,
+        'message': 'Logged out successfully'
+    }), 200
+
+
+@app.route('/api/auth/profile', methods=['PUT'])
+@token_required
+def update_profile(user):
+    """Update user profile information"""
+    try:
+        # Handle multipart/form-data for file upload
+        full_name = request.form.get('full_name')
+        username = request.form.get('username')
+        bio = request.form.get('bio')
+        location = request.form.get('location')
+        phone = request.form.get('phone')
+        
+        # Update fields if provided
+        if full_name:
+            user.full_name = full_name
+        
+        if username:
+            # Check if username is already taken by another user
+            existing_user = User.query.filter(User.username == username, User.id != user.id).first()
+            if existing_user:
+                return jsonify({
+                    'success': False,
+                    'message': 'Username already taken'
+                }), 400
+            user.username = username
+        
+        if bio is not None:  # Allow empty string
+            user.bio = bio
+        
+        if location is not None:
+            user.location = location
+        
+        if phone is not None:
+            user.phone = phone
+        
+        # Handle profile picture upload
+        if 'profile_picture' in request.files:
+            file = request.files['profile_picture']
+            if file and file.filename:
+                # Save file as base64 (or you can save to disk/cloud storage)
+                import base64
+                file_data = file.read()
+                base64_image = f"data:{file.content_type};base64," + base64.b64encode(file_data).decode('utf-8')
+                user.profile_picture = base64_image
+        
+        user.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        logger.info(f"Profile updated for user: {user.email}")
+        return jsonify({
+            'success': True,
+            'message': 'Profile updated successfully',
+            'user': user.to_dict()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error updating profile: {str(e)}")
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'message': 'Failed to update profile'
+        }), 500
+
+
+@app.route('/api/auth/change-password', methods=['POST'])
+@token_required
+def change_password(user):
+    """Change user password"""
+    try:
+        data = request.json
+        current_password = data.get('current_password')
+        new_password = data.get('new_password')
+        
+        if not current_password or not new_password:
+            return jsonify({
+                'success': False,
+                'message': 'Current and new password are required'
+            }), 400
+        
+        # Check if user has a password (OAuth users might not)
+        if not user.password_hash:
+            return jsonify({
+                'success': False,
+                'message': 'Cannot change password for OAuth accounts'
+            }), 400
+        
+        # Verify current password
+        if not user.check_password(current_password):
+            return jsonify({
+                'success': False,
+                'message': 'Current password is incorrect'
+            }), 400
+        
+        # Validate new password
+        is_valid, validation_message = validate_password(new_password)
+        if not is_valid:
+            return jsonify({
+                'success': False,
+                'message': validation_message
+            }), 400
+        
+        # Set new password
+        user.set_password(new_password)
+        user.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        logger.info(f"Password changed for user: {user.email}")
+        return jsonify({
+            'success': True,
+            'message': 'Password changed successfully'
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error changing password: {str(e)}")
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'message': 'Failed to change password'
+        }), 500
+
+
+# ============================================
+# DISEASE DETECTION ENDPOINTS
+# ============================================
+
 @app.route('/api/predict', methods=['POST'])
-def predict():
+@optional_token
+def predict(user):
     """
     API endpoint for disease prediction
     Expects JSON with 'image' field containing base64 encoded image
     Optional: 'use_ai' field to request AI-enhanced recommendations
+    Works for both authenticated and guest users
     """
     try:
         if detector is None:
@@ -433,6 +846,25 @@ def predict():
         
         # Get prediction from model or demo mode
         result = detector.predict(data['image'])
+        
+        # Save to history if user is authenticated
+        if user and result.get('success'):
+            try:
+                history = DetectionHistory(
+                    user_id=user.id,
+                    disease=result['disease'],
+                    confidence=result['confidence'],
+                    severity=result.get('severity'),
+                    latitude=data.get('latitude'),
+                    longitude=data.get('longitude'),
+                    location_name=data.get('location')
+                )
+                db.session.add(history)
+                db.session.commit()
+                result['saved_to_history'] = True
+            except Exception as e:
+                logger.error(f"Error saving to history: {str(e)}")
+                result['saved_to_history'] = False
         
         # Optionally add AI-enhanced recommendations
         if result.get('success') and data.get('use_ai', False) and ai_enabled:
@@ -503,6 +935,30 @@ def get_disease_info(disease_key):
             "error": str(e)
         }), 500
 
+@app.route('/api/history', methods=['GET'])
+@token_required
+def get_history(user):
+    """Get detection history for authenticated user"""
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 20, type=int)
+        
+        history_query = DetectionHistory.query.filter_by(user_id=user.id).order_by(DetectionHistory.detected_at.desc())
+        paginated = history_query.paginate(page=page, per_page=per_page, error_out=False)
+        
+        return jsonify({
+            'success': True,
+            'history': [item.to_dict() for item in paginated.items],
+            'total': paginated.total,
+            'pages': paginated.pages,
+            'current_page': page
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Get history error: {str(e)}")
+        return jsonify({'success': False, 'message': 'Failed to retrieve history', 'error': str(e)}), 500
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint with detailed status"""
@@ -516,6 +972,7 @@ def health_check():
         "mode": mode,
         "pytorch_available": PYTORCH_AVAILABLE,
         "ai_enabled": ai_enabled,
+        "auth_enabled": True,
         "diseases_count": len(DISEASE_DATABASE),
         "timestamp": datetime.now().isoformat()
     })
